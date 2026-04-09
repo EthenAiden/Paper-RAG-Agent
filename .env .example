@@ -1,0 +1,39 @@
+# DeepSeek LLM
+DEEPSEEK_API_KEY=
+DEEPSEEK_BASE_URL=
+DEEPSEEK_MODEL=deepseek-v3.2
+
+# OpenAI-compatible Embedding (推荐使用 text-embedding-3-small 或兼容接口)
+EMBEDDING_API_KEY=
+EMBEDDING_BASE_URL=
+EMBEDDING_MODEL=text-embedding-v4
+EMBEDDING_DIMENSION=1024
+
+# Milvus
+MILVUS_HOST=localhost
+MILVUS_PORT=19530
+MILVUS_COLLECTION=rag_documents
+
+# MySQL
+MYSQL_HOST=localhost
+MYSQL_PORT=3306
+MYSQL_USER=root
+MYSQL_PASSWORD=your_mysql_password
+MYSQL_DATABASE=rag_db
+
+# Redis
+REDIS_HOST=localhost
+REDIS_PORT=6379
+REDIS_PASSWORD=
+REDIS_DB=0
+REDIS_TTL=3600
+
+# App
+APP_HOST=0.0.0.0
+APP_PORT=8000
+APP_DEBUG=false
+
+# LangFuse (可选，留空则不启用)
+LANGFUSE_PUBLIC_KEY=
+LANGFUSE_SECRET_KEY=
+LANGFUSE_HOST=https://cloud.langfuse.com
