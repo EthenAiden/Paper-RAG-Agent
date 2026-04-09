@@ -76,8 +76,8 @@ class AliyunEmbeddings(Embeddings):
                     raise
     
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
-        # 分批处理，每批最多 20 条
-        batch_size = 20
+        # 分批处理，阿里云限制每批最多 10 条
+        batch_size = 10
         all_embeddings = []
         for i in range(0, len(texts), batch_size):
             batch = texts[i:i + batch_size]

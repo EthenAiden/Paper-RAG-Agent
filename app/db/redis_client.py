@@ -133,3 +133,43 @@ async def embedding_cache_get(text: str) -> list[float] | None:
 async def embedding_cache_set(text: str, embedding: list[float]) -> None:
     """缓存 embedding 向量"""
     await cache_set(_embedding_key(text), embedding, ttl=_EMB_TTL)
+
+
+# 同步版本（用于在 asyncio.to_thread 中调用）
+def embedding_cache_get_sync(text: str) -> list[float] | None:
+    """同步获取缓存的 embedding"""
+    import redis
+    client = redis.Redis(
+        host=settings.redis_host,
+        port=settings.redis_port,
+        password=settings.redis_password or None,
+        db=settings.redis_db,
+        decode_responses=True,
+    )
+    try:
+        key = _embedding_key(text)
+        data = client.get(key)
+        if data is None:
+            return None
+        import json
+        return json.loads(data)
+    finally:
+        client.close()
+
+
+def embedding_cache_set_sync(text: str, embedding: list[float]) -> None:
+    """同步缓存 embedding 向量"""
+    import redis
+    import json
+    client = redis.Redis(
+        host=settings.redis_host,
+        port=settings.redis_port,
+        password=settings.redis_password or None,
+        db=settings.redis_db,
+        decode_responses=True,
+    )
+    try:
+        key = _embedding_key(text)
+        client.set(key, json.dumps(embedding), ex=_EMB_TTL)
+    finally:
+        client.close()

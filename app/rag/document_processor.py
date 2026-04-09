@@ -34,7 +34,7 @@ from app.core.llm import get_embeddings
 from app.db.milvus_client import insert_chunks, get_collection
 from app.db.minio_client import download_file
 from app.db.mysql import DocumentChunk
-from app.db.redis_client import embedding_cache_get, embedding_cache_set
+from app.db.redis_client import embedding_cache_get_sync, embedding_cache_set_sync
 
 logger = logging.getLogger(__name__)
 
@@ -183,7 +183,7 @@ def process_document_sync(minio_object_path: str, doc_id: int, resume: bool = Fa
     cached_embeddings = {}  # child_id -> embedding
 
     for child_id, parent_id, text in children_to_process:
-        embedding = asyncio.run(embedding_cache_get(text))
+        embedding = embedding_cache_get_sync(text)
         if embedding is not None:
             cached_embeddings[child_id] = embedding
             cache_hit_count += 1
@@ -194,7 +194,7 @@ def process_document_sync(minio_object_path: str, doc_id: int, resume: bool = Fa
 
     # 批量计算 embedding
     if texts_need_embedding:
-        batch_size = 20
+        batch_size = 10  # 阿里云限制每批最多 10 条
         for i in range(0, len(texts_need_embedding), batch_size):
             batch = texts_need_embedding[i:i + batch_size]
             batch_texts = [t for _, _, t in batch]
@@ -205,7 +205,7 @@ def process_document_sync(minio_object_path: str, doc_id: int, resume: bool = Fa
                 
                 for child_id, text, emb in zip(batch_ids, batch_texts, batch_embeddings):
                     cached_embeddings[child_id] = emb
-                    asyncio.run(embedding_cache_set(text, emb))
+                    embedding_cache_set_sync(text, emb)
                     
             except Exception as e:
                 logger.error(f"[文档处理] 批量嵌入失败: batch_start={i}, error={str(e)}")
