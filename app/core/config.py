@@ -50,6 +50,10 @@ class Settings(BaseSettings):
     langfuse_secret_key: str = ""
     langfuse_host: str = "https://cloud.langfuse.com"
 
+    # 百度 OCR
+    baidu_ocr_api_key: str = ""
+    baidu_ocr_secret_key: str = ""
+
     @property
     def mysql_url(self) -> str:
         return (

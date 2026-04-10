@@ -43,7 +43,6 @@ def rewrite_query(question: str) -> list[str]:
 def retrieve(
     question: str,
     top_k: int = 5,
-    course_id: int | None = None,
     doc_ids: list[int] | None = None,
 ) -> list[Document]:
     """
@@ -52,13 +51,12 @@ def retrieve(
     Args:
         question: 用户问题
         top_k: 返回结果数量
-        course_id: 课程ID，用于过滤
         doc_ids: 文档ID列表，用于过滤
     
     Returns:
         检索到的文档列表
     """
-    logger.info(f"[检索] 开始: question={question[:50]}..., course_id={course_id}")
+    logger.info(f"[检索] 开始: question={question[:50]}...")
     
     embeddings_model = get_embeddings()
     
@@ -86,8 +84,13 @@ def retrieve(
     # 按相似度分数降序
     all_hits.sort(key=lambda x: x.get("score", 0), reverse=True)
     
-    # 相关性过滤（保留分数 > 0.35 的结果）
-    filtered = [h for h in all_hits if h.get("score", 0) > 0.35][:top_k]
+    # 记录实际分数用于调试
+    if all_hits:
+        top_scores = [h.get("score", 0) for h in all_hits[:5]]
+        logger.info(f"[检索] Top分数: {top_scores}")
+    
+    # 相关性过滤（保留分数 > 0.2 的结果，cosine相似度通常在0.3-0.8之间）
+    filtered = [h for h in all_hits if h.get("score", 0) > 0.2][:top_k]
     
     logger.info(f"[检索] 结果: total={len(all_hits)}, filtered={len(filtered)}")
     

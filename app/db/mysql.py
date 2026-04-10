@@ -6,7 +6,16 @@ from app.core.config import get_settings
 
 settings = get_settings()
 
-engine = create_async_engine(settings.mysql_url, echo=settings.app_debug)
+# 连接池配置
+engine = create_async_engine(
+    settings.mysql_url,
+    echo=settings.app_debug,
+    pool_size=10,           # 连接池大小
+    max_overflow=20,        # 最大溢出连接数
+    pool_timeout=30,        # 获取连接超时时间
+    pool_recycle=1800,      # 连接回收时间（秒）
+    pool_pre_ping=True,     # 连接前检查可用性
+)
 AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
 
 

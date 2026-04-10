@@ -45,6 +45,8 @@
 <script setup>
 import { ref, computed } from 'vue'
 import { marked } from 'marked'
+import katex from 'katex'
+import 'katex/dist/katex.min.css'
 
 const props = defineProps({
   message: Object
@@ -52,9 +54,62 @@ const props = defineProps({
 
 const showRefs = ref(false)
 
+// 渲染 LaTeX 公式
+function renderLatex(text) {
+  if (!text) return ''
+  
+  // 清理公式末尾的标点符号（句号、引号等）
+  function cleanFormula(formula) {
+    return formula.trim().replace(/[.,;:'"\\]+$/, '').trim()
+  }
+  
+  // 处理块级公式 $$...$$
+  text = text.replace(/\$\$([\s\S]+?)\$\$/g, (match, formula) => {
+    try {
+      return katex.renderToString(cleanFormula(formula), { displayMode: true, throwOnError: false })
+    } catch {
+      return match
+    }
+  })
+  
+  // 处理 [...] 块级公式（LLM 可能输出这种格式）
+  text = text.replace(/\[([\s\S]+?)\]/g, (match, formula) => {
+    if (match.includes('katex') || match.includes('来源:')) return match
+    try {
+      return katex.renderToString(cleanFormula(formula), { displayMode: true, throwOnError: false })
+    } catch {
+      return match
+    }
+  })
+  
+  // 处理 \(...\) 行内公式
+  text = text.replace(/\\\(([\s\S]+?)\\\)/g, (match, formula) => {
+    if (match.includes('katex')) return match
+    try {
+      return katex.renderToString(cleanFormula(formula), { displayMode: false, throwOnError: false })
+    } catch {
+      return match
+    }
+  })
+  
+  // 处理单 $ 行内公式
+  text = text.replace(/(?<!\$)\$(?!\$)([^\$\n]+?)\$(?!\$)/g, (match, formula) => {
+    if (match.includes('katex')) return match
+    try {
+      return katex.renderToString(cleanFormula(formula), { displayMode: false, throwOnError: false })
+    } catch {
+      return match
+    }
+  })
+  
+  return text
+}
+
 const renderedContent = computed(() => {
   if (!props.message.content) return ''
-  return marked.parse(props.message.content)
+  // 先渲染 LaTeX，再渲染 Markdown
+  const withLatex = renderLatex(props.message.content)
+  return marked.parse(withLatex)
 })
 </script>
 

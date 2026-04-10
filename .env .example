@@ -37,3 +37,8 @@ APP_DEBUG=false
 LANGFUSE_PUBLIC_KEY=
 LANGFUSE_SECRET_KEY=
 LANGFUSE_HOST=https://cloud.langfuse.com
+
+# 百度 OCR (可选，用于扫描件 PDF 识别)
+# 申请地址: https://cloud.baidu.com/product/ocr
+BAIDU_OCR_API_KEY=
+BAIDU_OCR_SECRET_KEY=

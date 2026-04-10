@@ -106,6 +106,9 @@ async def list_conversations(
 
 @router.get("/conversation/{conv_id}/history", summary="会话历史")
 async def get_history(conv_id: str, db: AsyncSession = Depends(get_db)):
+    from app.db.mysql import DocumentChunk, Document
+    from app.schemas.schemas import ReferenceInfo
+    
     conv = await db.get(Conversation, conv_id)
     if conv is None:
         raise HTTPException(status_code=404, detail="会话不存在")
@@ -119,14 +122,32 @@ async def get_history(conv_id: str, db: AsyncSession = Depends(get_db)):
 
     items = []
     for r in rows:
-        ref_ids = []
+        refs = None
         if r.reference_chunk_ids:
-            ref_ids = [int(x) for x in r.reference_chunk_ids.split(",") if x]
+            # 获取引用的 chunk 详情
+            chunk_ids = [int(x) for x in r.reference_chunk_ids.split(",") if x]
+            if chunk_ids:
+                chunk_result = await db.execute(
+                    select(DocumentChunk, Document.name)
+                    .join(Document, DocumentChunk.doc_id == Document.id)
+                    .where(DocumentChunk.id.in_(chunk_ids))
+                )
+                chunk_rows = chunk_result.all()
+                refs = [
+                    ReferenceInfo(
+                        id=i + 1,
+                        chunk_id=chunk.id,
+                        doc_name=doc_name,
+                        content=chunk.content[:200] + "..." if len(chunk.content) > 200 else chunk.content
+                    )
+                    for i, (chunk, doc_name) in enumerate(chunk_rows)
+                ]
+        
         items.append(MessageOut(
             id=r.id,
             role=r.role,
             content=r.content,
-            reference_chunks=ref_ids or None,
+            reference_chunks=refs,
             created_at=str(r.created_at),
         ))
     return ApiResponse(data=MessageListData(list=items))
@@ -163,14 +184,14 @@ async def _do_ask(req: AskRequest, db: AsyncSession) -> tuple[str, int, list[dic
         raise HTTPException(status_code=404, detail="会话不存在")
     history = await _load_history(req.conv_id, db)
 
-    # 3. 运行 LangGraph（内置查询改写 + 检索 + 生成）
+    # 3. 运行 LangGraph
     answer, _, references, detected_course = await run_chat(
         question=req.question,
         conversation_id=req.conv_id,
         history=history,
     )
 
-    # 4. 检索分块用于 references（使用已有检索器）
+    # 4. 检索分块用于 references
     docs = retrieve(req.question, top_k=req.top_k)
     chunk_ids_str = ",".join(str(d.metadata.get("chunk_db_id", 0)) for d in docs)
 
@@ -190,7 +211,6 @@ async def _do_ask(req: AskRequest, db: AsyncSession) -> tuple[str, int, list[dic
     )
     db.add(asst_msg)
 
-    # 更新会话消息计数
     conv.message_count = (conv.message_count or 0) + 2
     await db.commit()
     await db.refresh(asst_msg)
@@ -227,12 +247,10 @@ async def ask(req: AskRequest, db: AsyncSession = Depends(get_db)):
 
 @router.post("/chat/stream_ask", summary="流式问答（SSE）")
 async def stream_ask(req: AskRequest, db: AsyncSession = Depends(get_db)):
-    """
-    SSE 流式输出。使用 Agent 流程处理。
-    """
+    """SSE 流式输出。"""
     logger.info(f"[流式问答] conv_id={req.conv_id}, question={req.question[:50]}...")
     
-    # 语义缓存命中时直接模拟流式返回
+    # 语义缓存命中
     cached = await semantic_cache_get(req.question)
     if cached:
         logger.info(f"[流式问答] 命中语义缓存, conv_id={req.conv_id}")
@@ -241,21 +259,17 @@ async def stream_ask(req: AskRequest, db: AsyncSession = Depends(get_db)):
                 yield f"event: message\ndata: {json.dumps({'content': char}, ensure_ascii=False)}\n\n"
                 await asyncio.sleep(0)
             yield f"event: end\ndata: {json.dumps({'message_id': -1, 'references': cached['references']}, ensure_ascii=False)}\n\n"
-
         return StreamingResponse(_cached_stream(), media_type="text/event-stream")
 
     # 加载历史
     conv = await db.get(Conversation, req.conv_id)
     if conv is None:
-        logger.warning(f"[流式问答] 会话不存在, conv_id={req.conv_id}")
         raise HTTPException(status_code=404, detail="会话不存在")
     history = await _load_history(req.conv_id, db)
-    logger.info(f"[流式问答] 加载历史消息 {len(history)} 条, conv_id={req.conv_id}")
     
     conv_id = req.conv_id
     question = req.question
 
-    # 使用 Agent 流程（非流式生成，但整体响应更快）
     async def _stream() -> AsyncIterator[str]:
         from app.db.mysql import AsyncSessionLocal
         
@@ -266,39 +280,52 @@ async def stream_ask(req: AskRequest, db: AsyncSession = Depends(get_db)):
             history=history,
         )
         
-        # 模拟流式输出
+        # 流式输出
         for char in answer:
             yield f"event: message\ndata: {json.dumps({'content': char}, ensure_ascii=False)}\n\n"
             await asyncio.sleep(0)
         
-        logger.info(f"[流式问答] 生成完成, answer_len={len(answer)}, conv_id={conv_id}")
+        logger.info(f"[流式问答] 生成完成, answer_len={len(answer)}")
 
-        # 保存消息
-        async with AsyncSessionLocal() as session:
-            user_msg = ConversationMessage(conv_id=conv_id, role="user", content=question)
-            session.add(user_msg)
+        # 保存消息（使用独立的同步引擎）
+        message_id = -1
+        try:
+            from app.core.config import get_settings
+            from sqlalchemy import create_engine
+            from sqlalchemy.orm import Session
             
-            ref_ids = [r.get("chunk_id") for r in references if r.get("chunk_id")]
-            asst_msg = ConversationMessage(
-                conv_id=conv_id,
-                role="assistant",
-                content=answer,
-                reference_chunk_ids=",".join(str(i) for i in ref_ids) if ref_ids else None,
-            )
-            session.add(asst_msg)
+            settings = get_settings()
+            # 创建独立的同步引擎（不使用连接池，避免异步问题）
+            sync_url = settings.mysql_url.replace("+aiomysql", "+pymysql")
+            sync_engine = create_engine(sync_url, pool_pre_ping=True)
             
-            conv_obj = await session.get(Conversation, conv_id)
-            if conv_obj:
-                conv_obj.message_count = (conv_obj.message_count or 0) + 2
-            await session.commit()
-            await session.refresh(asst_msg)
-            logger.info(f"[流式问答] 消息已保存, message_id={asst_msg.id}, conv_id={conv_id}")
+            with Session(sync_engine) as session:
+                user_msg = ConversationMessage(conv_id=conv_id, role="user", content=question)
+                session.add(user_msg)
+                
+                ref_ids = [r.get("chunk_id") for r in references if r.get("chunk_id")]
+                asst_msg = ConversationMessage(
+                    conv_id=conv_id,
+                    role="assistant",
+                    content=answer,
+                    reference_chunk_ids=",".join(str(i) for i in ref_ids) if ref_ids else None,
+                )
+                session.add(asst_msg)
+                
+                conv_obj = session.get(Conversation, conv_id)
+                if conv_obj:
+                    conv_obj.message_count = (conv_obj.message_count or 0) + 2
+                session.commit()
+                message_id = asst_msg.id
+            
+            logger.info(f"[流式问答] 消息已保存, message_id={message_id}")
 
             await conv_cache_append(conv_id, "user", question)
             await conv_cache_append(conv_id, "assistant", answer)
-
             await semantic_cache_set(question, answer, references)
+        except Exception as e:
+            logger.error(f"[流式问答] 保存消息失败: {e}")
 
-            yield f"event: end\ndata: {json.dumps({'message_id': asst_msg.id, 'references': references, 'course': detected_course}, ensure_ascii=False)}\n\n"
+        yield f"event: end\ndata: {json.dumps({'message_id': message_id, 'references': references, 'course': detected_course}, ensure_ascii=False)}\n\n"
 
     return StreamingResponse(_stream(), media_type="text/event-stream")

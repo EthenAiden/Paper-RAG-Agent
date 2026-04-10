@@ -26,6 +26,9 @@ from langchain_community.document_loaders import (
     TextLoader,
     UnstructuredMarkdownLoader,
 )
+import httpx
+import fitz  # PyMuPDF
+import os
 from langchain_core.documents import Document as LCDocument
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -56,12 +59,132 @@ def _count_tokens(text: str) -> int:
 def _load_file(file_path: str) -> list[LCDocument]:
     ext = Path(file_path).suffix.lower()
     if ext == ".pdf":
+        # 先尝试用 PyMuPDF 提取文本层
         loader = PyMuPDFLoader(file_path)
+        docs = loader.load()
+        
+        # 检查是否提取到内容（如果内容很少，可能是扫描件）
+        total_text = "".join(d.page_content for d in docs).strip()
+        if len(total_text) < 100:  # 内容太少，调用 百度OCR
+            logger.info(f"[文档处理] 文本内容少，调用 百度OCR: {file_path}")
+            try:
+                ocr_text = _ocr_space(file_path)
+                docs = [LCDocument(page_content=ocr_text, metadata={"source": file_path})]
+                logger.info(f"[文档处理] OCR 完成，字符数: {len(ocr_text)}")
+            except Exception as e:
+                logger.error(f"[文档处理] OCR 失败: {e}")
+        return docs
     elif ext in {".md", ".markdown"}:
         loader = UnstructuredMarkdownLoader(file_path)
     else:
         loader = TextLoader(file_path, encoding="utf-8")
     return loader.load()
+
+
+def _ocr_space(file_path: str) -> str:
+    """调用百度 OCR API（支持大文件分页处理）"""
+    import fitz  # PyMuPDF
+    import time
+    import base64
+    
+    from app.core.config import get_settings
+    settings = get_settings()
+    
+    # 检查文件大小
+    file_size = os.path.getsize(file_path)
+    max_size = 1 * 1024 * 1024  # 1MB 限制
+    
+    if file_size <= max_size:
+        # 小文件直接上传
+        return _baidu_ocr_single(file_path)
+    
+    # 大文件：分页提取图片，逐页 OCR
+    logger.info(f"[OCR] 文件较大 ({file_size / 1024 / 1024:.2f}MB)，分页处理")
+    
+    doc = fitz.open(file_path)
+    text_parts = []
+    
+    for page_num in range(len(doc)):
+        page = doc[page_num]
+        
+        # 将页面渲染为图片
+        mat = fitz.Matrix(2, 2)  # 2x 放大提高识别率
+        pix = page.get_pixmap(matrix=mat)
+        
+        # 转为 PNG 字节
+        img_bytes = pix.tobytes("png")
+        
+        # 调用百度 OCR
+        try:
+            page_text = _baidu_ocr_bytes(img_bytes)
+            text_parts.append(page_text)
+            logger.info(f"[OCR] 第 {page_num + 1}/{len(doc)} 页完成")
+            time.sleep(0.5)  # 避免频率限制
+        except Exception as e:
+            logger.warning(f"[OCR] 第 {page_num + 1} 页失败: {e}")
+    
+    doc.close()
+    return "\n".join(text_parts)
+
+
+def _get_baidu_access_token() -> str:
+    """获取百度 OCR access_token"""
+    from app.core.config import get_settings
+    settings = get_settings()
+    
+    url = "https://aip.baidubce.com/oauth/2.0/token"
+    params = {
+        "grant_type": "client_credentials",
+        "client_id": settings.baidu_ocr_api_key,
+        "client_secret": settings.baidu_ocr_secret_key,
+    }
+    
+    response = httpx.post(url, params=params, timeout=30)
+    response.raise_for_status()
+    return response.json()["access_token"]
+
+
+def _baidu_ocr_single(file_path: str) -> str:
+    """单文件百度 OCR"""
+    import base64
+    
+    with open(file_path, "rb") as f:
+        img_base64 = base64.b64encode(f.read()).decode()
+    
+    return _baidu_ocr_base64(img_base64)
+
+
+def _baidu_ocr_bytes(img_bytes: bytes) -> str:
+    """对图片字节进行百度 OCR"""
+    import base64
+    img_base64 = base64.b64encode(img_bytes).decode()
+    return _baidu_ocr_base64(img_base64)
+
+
+def _baidu_ocr_base64(img_base64: str) -> str:
+    """调用百度 OCR API"""
+    access_token = _get_baidu_access_token()
+    
+    url = f"https://aip.baidubce.com/rest/2.0/ocr/v1/general_basic?access_token={access_token}"
+    
+    data = {
+        "image": img_base64,
+        "language_type": "CHN_ENG",  # 中英文混合
+    }
+    
+    response = httpx.post(url, data=data, timeout=60)
+    response.raise_for_status()
+    result = response.json()
+    
+    if "error_code" in result:
+        raise Exception(f"百度 OCR 失败: {result.get('error_msg', 'Unknown error')}")
+    
+    # 提取文字
+    words_list = result.get("words_result", [])
+    return "\n".join(item["words"] for item in words_list)
+
+
+
 
 
 def _split_parent_child(docs: list[LCDocument]) -> list[tuple[str, LCDocument, list[LCDocument]]]:
@@ -194,7 +317,7 @@ def process_document_sync(minio_object_path: str, doc_id: int, resume: bool = Fa
 
     # 批量计算 embedding
     if texts_need_embedding:
-        batch_size = 10  # 阿里云限制每批最多 10 条
+        batch_size = 100  # OpenAI 支持较大批次
         for i in range(0, len(texts_need_embedding), batch_size):
             batch = texts_need_embedding[i:i + batch_size]
             batch_texts = [t for _, _, t in batch]
@@ -217,6 +340,9 @@ def process_document_sync(minio_object_path: str, doc_id: int, resume: bool = Fa
     milvus_records = []
     chunk_meta = []
     chunk_index = 0
+
+    # 建立 (parent_id, child_text) -> child_id 的映射
+    child_key_to_id = {(pid, text): cid for cid, pid, text in children_to_process}
 
     for parent_id, parent_doc, children in pairs:
         parent_text = parent_doc.page_content.strip()
@@ -241,7 +367,11 @@ def process_document_sync(minio_object_path: str, doc_id: int, resume: bool = Fa
             if not child_text:
                 continue
             
-            child_id = str(uuid.uuid4())
+            # 用 (parent_id, child_text) 找到之前生成的 child_id
+            child_id = child_key_to_id.get((parent_id, child_text))
+            if not child_id:
+                continue
+            
             embedding = cached_embeddings.get(child_id)
             
             if embedding:
@@ -261,14 +391,19 @@ def process_document_sync(minio_object_path: str, doc_id: int, resume: bool = Fa
                 })
                 chunk_index += 1
             
-            if len(milvus_records) >= 50:
+            if len(milvus_records) >= 200:
                 insert_chunks(milvus_records)
                 logger.info(f"[文档处理] 批量写入Milvus: doc_id={doc_id}, batch_size={len(milvus_records)}")
                 milvus_records = []
 
     if milvus_records:
         insert_chunks(milvus_records)
-        logger.info(f"[文档处理] 向量已写入Milvus: doc_id={doc_id}, chunks={chunk_index}")
+    
+    # 最后统一 flush
+    from app.db.milvus_client import get_collection
+    col = get_collection()
+    col.flush()
+    logger.info(f"[文档处理] 向量已写入Milvus: doc_id={doc_id}, chunks={chunk_index}")
 
     logger.info(f"[文档处理] 同步处理完成: doc_id={doc_id}, total_chunks={chunk_index}, cache_hit={cache_hit_count}")
     return chunk_meta

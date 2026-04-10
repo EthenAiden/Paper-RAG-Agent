@@ -40,6 +40,7 @@ class ChatState(TypedDict):
     # 课程相关
     detected_course: str | None
     course_id: int | None
+    doc_ids: list[int] | None  # 相关文档ID列表
     
     # 检索相关
     retrieved_docs: list[dict]
@@ -72,13 +73,16 @@ _CLASSIFY_PROMPT = ChatPromptTemplate.from_messages([
 _COURSE_DETECT_PROMPT = ChatPromptTemplate.from_messages([
     (
         "system",
-        "你是一个课程识别专家。根据用户问题，判断可能涉及哪门课程。\n\n"
-        "可选课程列表：\n"
-        "{course_list}\n\n"
+        "你是一个课程识别专家。根据用户问题，从知识库文档中选择最相关的文档。\n\n"
+        "知识库中的文档：\n"
+        "{doc_list}\n\n"
         "输出规则：\n"
-        "- 如果能确定课程，只输出课程名称\n"
-        "- 如果无法确定，输出 unknown\n"
-        "- 如果涉及多门课程，输出最相关的一门",
+        "- 根据问题内容，选择最相关的文档（可以选多个，用逗号分隔）\n"
+        "- 直接输出文档名称（完全匹配上面的文档名）\n"
+        "- 如果无法确定，输出 unknown\n\n"
+        "示例：\n"
+        "问题：什么是洛必达法则\n"
+        "输出：Calculus Volume 1.pdf, 普林斯顿微积分读本.pdf",
     ),
     ("human", "{question}"),
 ])
@@ -114,6 +118,11 @@ _RAG_PROMPT = ChatPromptTemplate.from_messages([
         "2. 在使用参考资料时，标注引用来源，格式为 [来源:n]\n"
         "3. 如果资料不足，诚实说明并尝试用自身知识补充\n"
         "4. 语言简洁清晰\n\n"
+        "【数学公式格式要求】\n"
+        "- 行内公式：用 $...$ 包裹，如 $f(x)$\n"
+        "- 块级公式：用 $$...$$ 包裹，如 $$\\lim_{x \\to a} f(x)$$\n"
+        "- 公式内不要有多余的标点符号（如句号、引号）\n"
+        "- 示例：求 $\\lim_{x \\to 0} \\frac{\\sin x}{x}$ 的值。\n\n"
         "课程：{course_name}\n\n"
         "参考资料：\n{context_with_refs}",
     ),
@@ -176,23 +185,57 @@ def _classify_node(state: ChatState) -> dict:
 
 
 def _course_detect_node(state: ChatState) -> dict:
-    """课程识别节点"""
+    """课程识别节点 - 检索 + LLM 判断"""
     logger.info(f"[Agent] 课程识别节点")
     
+    from app.db.mysql import get_db, Document
+    from sqlalchemy import select
+    
+    # 1. 从数据库获取所有文档
+    import asyncio
+    async def _get_docs():
+        async for session in get_db():
+            result = await session.execute(select(Document.id, Document.name))
+            return [(row[0], row[1]) for row in result.fetchall()]
+    
+    try:
+        docs = asyncio.run(_get_docs())
+    except:
+        docs = []
+    
+    if not docs:
+        logger.info(f"[Agent] 课程识别结果: course=None (无文档)")
+        return {"detected_course": None, "doc_ids": None}
+    
+    # 2. 用 LLM 判断最相关的课程
+    doc_list = [name for _, name in docs]
     llm = get_llm()
-    course_list = _get_course_list()
     chain = _COURSE_DETECT_PROMPT | llm
     result = chain.invoke({
         "question": state["question"],
-        "course_list": course_list,
+        "doc_list": "\n".join(f"- {doc}" for doc in doc_list),
     })
     
     detected_course = result.content.strip()
     if detected_course.lower() == "unknown":
         detected_course = None
+        doc_ids = None
+    else:
+        # 3. 根据文档名找到对应的文档ID列表
+        # LLM 可能输出多个文档名，用逗号分隔
+        selected_names = [name.strip() for name in detected_course.split(",")]
+        doc_ids = [doc_id for doc_id, name in docs if name in selected_names]
+        
+        # 如果没匹配到，尝试模糊匹配
+        if not doc_ids:
+            for doc_id, name in docs:
+                for selected in selected_names:
+                    if selected.lower() in name.lower() or name.lower() in selected.lower():
+                        doc_ids.append(doc_id)
+                        break
     
-    logger.info(f"[Agent] 课程识别结果: course={detected_course}")
-    return {"detected_course": detected_course}
+    logger.info(f"[Agent] 课程识别结果: course={detected_course}, doc_ids={doc_ids}")
+    return {"detected_course": detected_course, "doc_ids": doc_ids}
 
 
 def _clarify_node(state: ChatState) -> dict:
@@ -213,13 +256,13 @@ def _clarify_node(state: ChatState) -> dict:
 
 def _retrieve_node(state: ChatState) -> dict:
     """检索节点"""
-    logger.info(f"[Agent] 检索节点: course={state.get('detected_course')}")
+    logger.info(f"[Agent] 检索节点: course={state.get('detected_course')}, doc_ids={state.get('doc_ids')}")
     
     # 检索相关文档
     docs = retrieve(
         state["question"],
         top_k=5,
-        course_id=state.get("course_id"),  # 按课程过滤
+        doc_ids=state.get("doc_ids"),  # 按文档ID过滤
     )
     
     # 转换为字典格式
@@ -245,8 +288,8 @@ def _grade_docs_node(state: ChatState) -> dict:
     if not docs:
         return {"retrieval_quality": "none"}
     
-    # 简单评分：基于分数阈值
-    high_score_count = sum(1 for d in docs if d.get("score", 0) > 0.6)
+    # 简单评分：基于分数阈值（cosine相似度通常在0.3-0.8之间）
+    high_score_count = sum(1 for d in docs if d.get("score", 0) > 0.4)
     
     if high_score_count >= 2:
         quality = "high"

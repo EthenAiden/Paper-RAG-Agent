@@ -75,11 +75,18 @@ class ConversationCreateData(BaseModel):
 
 # ── 消息 ──────────────────────────────────────────────────
 
+class ReferenceInfo(BaseModel):
+    id: int
+    chunk_id: int
+    doc_name: str
+    content: str
+
+
 class MessageOut(BaseModel):
     id: int
     role: str
     content: str
-    reference_chunks: Optional[list[int]] = None
+    reference_chunks: Optional[list[ReferenceInfo]] = None
     created_at: str
 
 

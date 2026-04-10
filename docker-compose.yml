@@ -134,6 +134,14 @@ services:
       timeout: 5s
       retries: 3
 
+  # ── OCR 服务 ─────────────────────────────────────────────
+  ocr:
+    build: ./ocr_service
+    container_name: rag-ocr
+    restart: unless-stopped
+    ports:
+      - "8001:8001"
+
 volumes:
   etcd_data:
   minio_data:

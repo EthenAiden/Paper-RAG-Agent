@@ -1,10 +1,9 @@
 from app.core.config import get_settings
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_openai import ChatOpenAI
 from langfuse.langchain import CallbackHandler
 from langchain_core.embeddings import Embeddings
 from typing import List
-import dashscope
-from dashscope import TextEmbedding
+from openai import OpenAI
 import os
 import logging
 
@@ -45,63 +44,44 @@ def get_llm() -> ChatOpenAI:
     )
 
 
-class AliyunEmbeddings(Embeddings):
-    """阿里云嵌入模型适配器"""
+class OpenAIEmbeddingsAdapter(Embeddings):
+    """OpenAI 嵌入模型适配器"""
     
-    def __init__(self, api_key: str, model: str):
-        self.api_key = api_key
+    def __init__(self, api_key: str, base_url: str, model: str):
+        self.client = OpenAI(api_key=api_key, base_url=base_url)
         self.model = model
-        dashscope.api_key = api_key
-    
-    def _embed_with_retry(self, texts: List[str], max_retries: int = 3) -> List[List[float]]:
-        """带重试的嵌入调用"""
-        import time
-        for retry in range(max_retries):
-            try:
-                result = TextEmbedding.call(
-                    model=self.model,
-                    input=texts,
-                    parameters={"text_type": "document"}
-                )
-                if result.status_code == 200:
-                    return [item['embedding'] for item in result.output['embeddings']]
-                else:
-                    raise Exception(f"API error: {result.code} - {result.message}")
-            except Exception as e:
-                if retry < max_retries - 1:
-                    wait_time = (retry + 1) * 2  # 2s, 4s, 6s
-                    logger.warning(f"[阿里云嵌入] 调用失败，{wait_time}秒后重试 ({retry+1}/{max_retries}): {str(e)[:100]}")
-                    time.sleep(wait_time)
-                else:
-                    raise
     
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
-        # 分批处理，阿里云限制每批最多 10 条
-        batch_size = 10
+        """批量生成嵌入向量"""
         all_embeddings = []
+        batch_size = 100  # OpenAI 支持较大批次
+        
         for i in range(0, len(texts), batch_size):
             batch = texts[i:i + batch_size]
-            embeddings = self._embed_with_retry(batch)
-            all_embeddings.extend(embeddings)
-            # 批次间短暂休息，避免限流
-            if i + batch_size < len(texts):
-                import time
-                time.sleep(0.5)
+            try:
+                response = self.client.embeddings.create(
+                    model=self.model,
+                    input=batch
+                )
+                embeddings = [item.embedding for item in response.data]
+                all_embeddings.extend(embeddings)
+            except Exception as e:
+                logger.error(f"[OpenAI嵌入] 批量嵌入失败: {str(e)}")
+                raise
+        
         return all_embeddings
     
     def embed_query(self, text: str) -> List[float]:
-        result = self._embed_with_retry([text])
-        return result[0]
+        """生成单个文本的嵌入向量"""
+        response = self.client.embeddings.create(
+            model=self.model,
+            input=text
+        )
+        return response.data[0].embedding
 
 
 def get_embeddings() -> Embeddings:
-    # 判断是否使用阿里云嵌入模型
-    if "dashscope" in _settings.embedding_base_url.lower() or "aliyun" in _settings.embedding_model.lower():
-        return AliyunEmbeddings(
-            api_key=_settings.embedding_api_key,
-            model=_settings.embedding_model,
-        )
-    return OpenAIEmbeddings(
+    return OpenAIEmbeddingsAdapter(
         api_key=_settings.embedding_api_key,
         base_url=_settings.embedding_base_url,
         model=_settings.embedding_model,

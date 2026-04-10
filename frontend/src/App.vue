@@ -73,7 +73,7 @@ async function selectConversation(conv) {
     id: m.id,
     role: m.role,
     content: m.content,
-    references: m.reference_chunks
+    references: m.reference_chunks || []
   }))
 }
 
