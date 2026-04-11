@@ -77,7 +77,7 @@ class ConversationCreateData(BaseModel):
 
 class ReferenceInfo(BaseModel):
     id: int
-    chunk_id: int
+    chunk_id: Optional[int] = None
     doc_name: str
     content: str
 

@@ -123,25 +123,12 @@ async def get_history(conv_id: str, db: AsyncSession = Depends(get_db)):
     items = []
     for r in rows:
         refs = None
-        if r.reference_chunk_ids:
-            # 获取引用的 chunk 详情
-            chunk_ids = [int(x) for x in r.reference_chunk_ids.split(",") if x]
-            if chunk_ids:
-                chunk_result = await db.execute(
-                    select(DocumentChunk, Document.name)
-                    .join(Document, DocumentChunk.doc_id == Document.id)
-                    .where(DocumentChunk.id.in_(chunk_ids))
-                )
-                chunk_rows = chunk_result.all()
-                refs = [
-                    ReferenceInfo(
-                        id=i + 1,
-                        chunk_id=chunk.id,
-                        doc_name=doc_name,
-                        content=chunk.content[:200] + "..." if len(chunk.content) > 200 else chunk.content
-                    )
-                    for i, (chunk, doc_name) in enumerate(chunk_rows)
-                ]
+        if r.references:
+            # 直接解析 JSON
+            try:
+                refs = json.loads(r.references)
+            except:
+                refs = None
         
         items.append(MessageOut(
             id=r.id,
@@ -171,14 +158,8 @@ async def delete_conversation(conv_id: str, db: AsyncSession = Depends(get_db)):
 async def _do_ask(req: AskRequest, db: AsyncSession) -> tuple[str, int, list[dict]]:
     """
     核心问答逻辑，返回 (answer, message_id, references)。
-    先检查语义缓存；未命中则走 RAG → 写 DB → 写缓存。
     """
-    # 1. 语义缓存命中
-    cached = await semantic_cache_get(req.question)
-    if cached:
-        return cached["answer"], -1, cached["references"]
-
-    # 2. 加载历史
+    # 1. 加载历史
     conv = await db.get(Conversation, req.conv_id)
     if conv is None:
         raise HTTPException(status_code=404, detail="会话不存在")
@@ -200,18 +181,25 @@ async def _do_ask(req: AskRequest, db: AsyncSession) -> tuple[str, int, list[dic
     db.add(user_msg)
     await db.flush()
 
-    ref_ids = [d.metadata.get("chunk_db_id") for d in docs if d.metadata.get("chunk_db_id")]
-    ref_ids_str = ",".join(str(i) for i in ref_ids) if ref_ids else None
-
+    # 存储 references 为 JSON
+    refs_json = json.dumps(references, ensure_ascii=False) if references else None
+    
     asst_msg = ConversationMessage(
         conv_id=req.conv_id,
         role="assistant",
         content=answer,
-        reference_chunk_ids=ref_ids_str,
+        references=refs_json,
     )
     db.add(asst_msg)
 
     conv.message_count = (conv.message_count or 0) + 2
+    
+    # 第一次对话时自动生成标题
+    if conv.title == "新对话" or not conv.title:
+        from app.graph.chat_graph import generate_title
+        conv.title = generate_title(req.question)
+        logger.info(f"[问答] 生成标题: {conv.title}")
+    
     await db.commit()
     await db.refresh(asst_msg)
 
@@ -228,9 +216,6 @@ async def _do_ask(req: AskRequest, db: AsyncSession) -> tuple[str, int, list[dic
         }
         for d in docs
     ]
-
-    # 8. 写语义缓存
-    await semantic_cache_set(req.question, answer, references)
 
     return answer, asst_msg.id, references
 
@@ -250,17 +235,6 @@ async def stream_ask(req: AskRequest, db: AsyncSession = Depends(get_db)):
     """SSE 流式输出。"""
     logger.info(f"[流式问答] conv_id={req.conv_id}, question={req.question[:50]}...")
     
-    # 语义缓存命中
-    cached = await semantic_cache_get(req.question)
-    if cached:
-        logger.info(f"[流式问答] 命中语义缓存, conv_id={req.conv_id}")
-        async def _cached_stream():
-            for char in cached["answer"]:
-                yield f"event: message\ndata: {json.dumps({'content': char}, ensure_ascii=False)}\n\n"
-                await asyncio.sleep(0)
-            yield f"event: end\ndata: {json.dumps({'message_id': -1, 'references': cached['references']}, ensure_ascii=False)}\n\n"
-        return StreamingResponse(_cached_stream(), media_type="text/event-stream")
-
     # 加载历史
     conv = await db.get(Conversation, req.conv_id)
     if conv is None:
@@ -303,18 +277,24 @@ async def stream_ask(req: AskRequest, db: AsyncSession = Depends(get_db)):
                 user_msg = ConversationMessage(conv_id=conv_id, role="user", content=question)
                 session.add(user_msg)
                 
-                ref_ids = [r.get("chunk_id") for r in references if r.get("chunk_id")]
+                # 存储 references 为 JSON
+                refs_json = json.dumps(references, ensure_ascii=False) if references else None
                 asst_msg = ConversationMessage(
                     conv_id=conv_id,
                     role="assistant",
                     content=answer,
-                    reference_chunk_ids=",".join(str(i) for i in ref_ids) if ref_ids else None,
+                    references=refs_json,
                 )
                 session.add(asst_msg)
                 
                 conv_obj = session.get(Conversation, conv_id)
                 if conv_obj:
                     conv_obj.message_count = (conv_obj.message_count or 0) + 2
+                    # 第一次对话时自动生成标题
+                    if conv_obj.title == "新对话" or not conv_obj.title:
+                        from app.graph.chat_graph import generate_title
+                        conv_obj.title = generate_title(question)
+                        logger.info(f"[流式问答] 生成标题: {conv_obj.title}")
                 session.commit()
                 message_id = asst_msg.id
             
@@ -322,7 +302,6 @@ async def stream_ask(req: AskRequest, db: AsyncSession = Depends(get_db)):
 
             await conv_cache_append(conv_id, "user", question)
             await conv_cache_append(conv_id, "assistant", answer)
-            await semantic_cache_set(question, answer, references)
         except Exception as e:
             logger.error(f"[流式问答] 保存消息失败: {e}")
 

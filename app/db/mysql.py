@@ -73,7 +73,7 @@ class ConversationMessage(Base):
     conv_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     role: Mapped[str] = mapped_column(String(20), nullable=False)  # user / assistant
     content: Mapped[str] = mapped_column(Text, nullable=False)
-    reference_chunk_ids: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    references: Mapped[str | None] = mapped_column(Text, nullable=True)  # JSON 格式存储引用信息
     created_at: Mapped[DateTime] = mapped_column(DateTime, server_default=func.now())
 
 

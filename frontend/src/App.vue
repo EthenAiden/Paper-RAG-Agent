@@ -57,7 +57,7 @@ async function createNewChat() {
   const { data } = await createConversation()
   const conv = { 
     id: data.data.conv_id, 
-    title: '新对话',
+    title: '',
     message_count: 0 
   }
   conversations.value.unshift(conv)
@@ -118,8 +118,11 @@ async function sendMessage(question) {
   
   loading.value = false
   
-  if (activeConv.value.title === '新对话') {
-    activeConv.value.title = question.slice(0, 20) + (question.length > 20 ? '...' : '')
+  // 刷新对话列表以获取新标题
+  if (!activeConv.value.title) {
+    await loadConversations()
+    const updated = conversations.value.find(c => c.id === activeConv.value.id)
+    if (updated) activeConv.value.title = updated.title
   }
 }
 </script>

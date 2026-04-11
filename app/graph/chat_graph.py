@@ -27,6 +27,31 @@ from app.rag.retriever import retrieve
 logger = logging.getLogger(__name__)
 
 
+# ---------- 标题生成 ----------
+
+_TITLE_PROMPT = ChatPromptTemplate.from_messages([
+    (
+        "system",
+        "请根据用户的第一个问题，为这个对话生成一个简短的标题（不超过15个字）。\n"
+        "标题要能概括对话主题，不要包含标点符号。\n"
+        "只输出标题，不要输出其他内容。",
+    ),
+    ("human", "{question}"),
+])
+
+
+def generate_title(question: str) -> str:
+    """根据第一个问题生成对话标题"""
+    llm = get_llm()
+    chain = _TITLE_PROMPT | llm
+    result = chain.invoke({"question": question})
+    title = result.content.strip()
+    # 限制长度
+    if len(title) > 20:
+        title = title[:20]
+    return title
+
+
 # ---------- State ----------
 
 class ChatState(TypedDict):
@@ -119,10 +144,10 @@ _RAG_PROMPT = ChatPromptTemplate.from_messages([
         "3. 如果资料不足，诚实说明并尝试用自身知识补充\n"
         "4. 语言简洁清晰\n\n"
         "【数学公式格式要求】\n"
-        "- 行内公式：用 $...$ 包裹，如 $f(x)$\n"
-        "- 块级公式：用 $$...$$ 包裹，如 $$\\lim_{x \\to a} f(x)$$\n"
+        "- 行内公式：用 $...$ 包裹，如 {{$f(x)$}}\n"
+        "- 块级公式：用 $$...$$ 包裹，如 {{$\\lim_{{x \\to a}} f(x)$}}\n"
         "- 公式内不要有多余的标点符号（如句号、引号）\n"
-        "- 示例：求 $\\lim_{x \\to 0} \\frac{\\sin x}{x}$ 的值。\n\n"
+        "- 示例：求 {{$\\lim_{{x \\to 0}} \\frac{{\\sin x}}{{x}}$}} 的值。\n\n"
         "课程：{course_name}\n\n"
         "参考资料：\n{context_with_refs}",
     ),
